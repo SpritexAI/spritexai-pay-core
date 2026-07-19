@@ -31,7 +31,7 @@ jobs:
             set -e
             REPO="${{ github.repository }}"
             IMAGE="ghcr.io/${REPO,,}:latest"
-            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            # Image is public on GHCR — no docker login needed.
             docker pull "$IMAGE"
             docker rm -f spritexai-pay 2>/dev/null || true
             docker run -d --name spritexai-pay \
