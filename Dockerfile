@@ -18,6 +18,10 @@ RUN rm -rf src
 COPY . .
 # Touch so cargo rebuilds against the real sources after the dependency cache layer.
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+# Ensure a static/ dir exists so the runtime COPY always succeeds. CI populates it
+# with the built dashboard before this image is built; an API-only build leaves it
+# empty (engine then just serves the API).
+RUN mkdir -p static
 
 FROM debian:bookworm-slim AS runtime
 # ca-certificates is needed for outbound HTTPS webhook delivery (rustls trust store).
@@ -27,11 +31,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 WORKDIR /app
 COPY --from=builder /build/target/release/spritexai-pay /usr/local/bin/spritexai-pay
+COPY --from=builder /build/static ./static
 
 # Data dir for the default SQLite database; override DATABASE_URL for Postgres.
 RUN mkdir -p /data && chown spritex:spritex /data
 USER spritex
-ENV DATABASE_URL="sqlite:///data/spritexai_pay.db?mode=rwc" PORT=8080
+ENV DATABASE_URL="sqlite:///data/spritexai_pay.db?mode=rwc" PORT=8080 STATIC_DIR="/app/static"
 EXPOSE 8080
 VOLUME ["/data"]
 

@@ -19,6 +19,9 @@ pub struct Config {
     // Consumed by the retry/idempotency queue in M3; absent → SQLite fallback path.
     #[allow(dead_code)]
     pub redis_url: Option<String>,
+    // Directory of built dashboard assets. Served (with SPA fallback) only if it
+    // exists — self-hosted API-only deployments simply omit it.
+    pub static_dir: String,
 }
 
 impl Config {
@@ -32,6 +35,7 @@ impl Config {
             sms_hmac_secret: env_or("SMS_HMAC_SECRET", "dev-insecure-secret-change-me"),
             webhook_hmac_secret: env_or("WEBHOOK_HMAC_SECRET", "dev-insecure-webhook-secret"),
             redis_url: std::env::var("REDIS_URL").ok().filter(|s| !s.is_empty()),
+            static_dir: env_or("STATIC_DIR", "./static"),
         })
     }
 }

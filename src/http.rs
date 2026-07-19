@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
 };
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 #[derive(Clone)]
@@ -63,8 +64,22 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .with_state(state)
         .layer(GovernorLayer {
             config: Arc::new(governor),
-        })
-        .layer(TraceLayer::new_for_http());
+        });
+
+    // Serve the built dashboard when its assets are present. Unknown paths fall
+    // back to index.html so client-side routing works. API-only self-hosted
+    // deployments simply don't ship a static dir. Static assets bypass the API
+    // rate limiter (applied above) so the SPA loads freely.
+    let app = match std::fs::metadata(&cfg.static_dir) {
+        Ok(m) if m.is_dir() => {
+            let index = format!("{}/index.html", cfg.static_dir);
+            tracing::info!(dir = %cfg.static_dir, "serving dashboard assets");
+            app.fallback_service(ServeDir::new(&cfg.static_dir).fallback(ServeFile::new(index)))
+        }
+        _ => app,
+    };
+
+    let app = app.layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
     tracing::info!(addr = %cfg.bind_addr, "listening");

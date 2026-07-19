@@ -4,6 +4,9 @@
 *.db-shm
 *.db-wal
 
+# Built dashboard assets — produced in CI from the dashboard repo, never committed
+/static
+
 # Env
 .env
 .env.local
