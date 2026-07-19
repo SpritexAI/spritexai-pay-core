@@ -1,0 +1,11 @@
+# Build artifacts
+/target
+*.db
+*.db-shm
+*.db-wal
+
+# Env
+.env
+.env.local
+
+# sqlx offline cache is committed intentionally (.sqlx/) for CI

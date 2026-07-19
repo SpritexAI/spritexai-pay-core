@@ -1,0 +1,44 @@
+# SpritEXAI Pay — deploy to VPS
+# Author: Mohammad Sijan (SpritexAI).
+#
+# The VPS never compiles Rust. CI already built and pushed the image to GHCR; this
+# job just SSHes in, pulls the finished image, and restarts the container. Triggered
+# after CI succeeds on main, or manually.
+
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    # Only deploy when the CI run actually succeeded.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            set -e
+            REPO="${{ github.repository }}"
+            IMAGE="ghcr.io/${REPO,,}:latest"
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull "$IMAGE"
+            docker rm -f spritexai-pay 2>/dev/null || true
+            docker run -d --name spritexai-pay \
+              --restart unless-stopped \
+              -p 127.0.0.1:8080:8080 \
+              -v spritexai_pay_data:/data \
+              -e SMS_HMAC_SECRET="${{ secrets.SMS_HMAC_SECRET }}" \
+              -e WEBHOOK_HMAC_SECRET="${{ secrets.WEBHOOK_HMAC_SECRET }}" \
+              "$IMAGE"
+            docker image prune -f

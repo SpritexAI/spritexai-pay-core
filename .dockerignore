@@ -1,0 +1,9 @@
+target
+.git
+.github
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+README.md
