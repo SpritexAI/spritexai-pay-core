@@ -4,7 +4,7 @@ AI-native, open-core payment orchestration for mobile financial services (bKash,
 Nagad). Runs comfortably on a modest VPS: a single Rust binary, SQLite by default,
 Redis only when you scale horizontally.
 
-Built by **Mohammad Sijan** ([SpritexAI](https://github.com/spritex)) — the team
+Built by **Mohammad Sijan** ([SpritexAI](https://github.com/SpritexAI)) — the team
 behind RexiO.
 
 ## What it does
