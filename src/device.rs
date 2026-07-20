@@ -107,3 +107,27 @@ pub async fn list_devices(db: &Db) -> Result<Vec<Device>, sqlx::Error> {
     .fetch_all(db)
     .await
 }
+
+/// Exchange a pairing token for the shared HMAC secret. The Android forwarder
+/// pairs once (QR carries only `{url, token}`), then calls this to fetch the
+/// secret it signs SMS payloads with — the secret never travels in the QR, so a
+/// photographed code alone can't leak it. Returns the active device's id and
+/// stamps `last_seen_at`; an unknown or revoked token yields None (→ 401).
+pub async fn exchange_token(db: &Db, token: &str) -> Result<Option<String>, sqlx::Error> {
+    let token_sha256 = crypto::sign(b"device-token", token.as_bytes());
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM devices WHERE token_sha256 = ? AND status = 'active'")
+            .bind(&token_sha256)
+            .fetch_optional(db)
+            .await?;
+
+    if let Some(ref id) = device_id {
+        sqlx::query(
+            "UPDATE devices SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+        )
+        .bind(id)
+        .execute(db)
+        .await?;
+    }
+    Ok(device_id)
+}

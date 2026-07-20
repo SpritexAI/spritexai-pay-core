@@ -86,3 +86,39 @@ async fn regex_suggestion_none_without_drift_data() {
     let db = test_db().await;
     assert!(ai::suggest_regex(&db, "bkash").await.is_none());
 }
+
+#[tokio::test]
+async fn token_exchange_resolves_active_device_only() {
+    let db = test_db().await;
+    let paired = device::pair_device(
+        &db,
+        device::PairDevice {
+            label: Some("Forwarder".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    // A valid, active pairing token resolves to its device id.
+    let id = device::exchange_token(&db, &paired.pairing_token)
+        .await
+        .unwrap();
+    assert_eq!(id.as_deref(), Some(paired.id.as_str()));
+
+    // Garbage or unknown token resolves to nothing (→ 401 at the HTTP layer).
+    assert!(device::exchange_token(&db, "spx_not_a_real_token")
+        .await
+        .unwrap()
+        .is_none());
+
+    // A revoked device no longer exchanges.
+    sqlx::query("UPDATE devices SET status = 'revoked' WHERE id = ?")
+        .bind(&paired.id)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(device::exchange_token(&db, &paired.pairing_token)
+        .await
+        .unwrap()
+        .is_none());
+}

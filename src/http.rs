@@ -86,6 +86,7 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/status", get(auth_status))
+        .route("/v1/devices/exchange", post(exchange_token))
         .route("/v1/webhooks/sms", post(sms_webhook))
         .merge(protected)
         .with_state(state)
@@ -173,6 +174,34 @@ async fn login(
 /// first bouncing a protected request off a 401.
 async fn auth_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "auth_required": state.admin_password.is_some() }))
+}
+
+#[derive(Deserialize)]
+struct ExchangeReq {
+    token: String,
+}
+
+/// The Android forwarder trades its pairing token for the shared SMS HMAC secret.
+/// Public (the app has only the pairing token, no admin session) but rate-limited.
+/// The secret is returned once per call over TLS; the token stays server-verified.
+async fn exchange_token(
+    State(state): State<AppState>,
+    Json(req): Json<ExchangeReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    match device::exchange_token(&state.db, &req.token).await {
+        Ok(Some(device_id)) => Ok((
+            StatusCode::OK,
+            Json(json!({
+                "device_id": device_id,
+                "gateway_secret": state.sms_hmac_secret.as_str(),
+            })),
+        )),
+        Ok(None) => Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "unknown or revoked pairing token".into(),
+        )),
+        Err(e) => Err(db_error(e)),
+    }
 }
 
 /// Bearer-token guard for the admin console routes. No-op when auth is disabled.
