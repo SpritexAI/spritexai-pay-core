@@ -46,6 +46,22 @@ fn garbage_sms_does_not_match() {
 }
 
 #[tokio::test]
+async fn unparseable_sms_errors_when_no_ai_providers() {
+    // Without OPENROUTER_API_KEY / OPENCODE_ZEN_API_KEY the AI fallback is skipped
+    // and the regex error surfaces — Phase 1 behavior, no network involved.
+    let db = test_db().await;
+    let result = sms::ingest(&db, "bkash", "totally drifted format with no fields").await;
+    assert!(matches!(result, Err(sms::IngestError::Parse(_))));
+
+    // Nothing was stored.
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sms_events")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(events, 0);
+}
+
+#[tokio::test]
 async fn replayed_sms_settles_charge_exactly_once() {
     let db = test_db().await;
 

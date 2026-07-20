@@ -45,6 +45,8 @@ jobs:
               -v spritexai_pay_data:/data \
               -e SMS_HMAC_SECRET="${{ secrets.SMS_HMAC_SECRET }}" \
               -e WEBHOOK_HMAC_SECRET="${{ secrets.WEBHOOK_HMAC_SECRET }}" \
+              -e OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}" \
+              -e OPENCODE_ZEN_API_KEY="${{ secrets.OPENCODE_ZEN_API_KEY }}" \
               "$IMAGE"
             docker logout ghcr.io || true
             docker image prune -f

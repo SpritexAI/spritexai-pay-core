@@ -32,20 +32,32 @@ pub struct Ingested {
 }
 
 /// Parse a raw SMS for the named gateway, store it idempotently, and reconcile.
+/// Regex first; on format drift the AI fallback chain takes over (Phase 2).
 pub async fn ingest(db: &Db, gw: &str, raw_body: &str) -> Result<Ingested, IngestError> {
-    let parsed = {
+    let raw_sha256 = crypto::sign(b"sms-audit", raw_body.as_bytes());
+
+    let (parsed, parse_source) = {
         let gateway = gateway::resolve(gw).ok_or(IngestError::UnknownGateway)?;
-        gateway.parse_sms(raw_body)?
+        let gateway_id = gateway.id();
+        match gateway.parse_sms(raw_body) {
+            Ok(p) => (p, "regex"),
+            Err(regex_err) => {
+                drop(gateway); // Box<dyn Gateway> must not cross the await below
+                match crate::ai::extract(db, gateway_id, raw_body, &raw_sha256).await {
+                    Some(p) => (p, "ai"),
+                    None => return Err(regex_err.into()),
+                }
+            }
+        }
     };
 
-    let raw_sha256 = crypto::sign(b"sms-audit", raw_body.as_bytes());
     let matched_charge = find_matching_charge(db, &parsed).await?;
 
     let event_id = format!("sms_{}", uuid::Uuid::new_v4().simple());
     let insert = sqlx::query(
         "INSERT INTO sms_events \
-         (id, gateway, txn_id, amount_minor, sender_msisdn, charge_id, raw_sha256, matched) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, gateway, txn_id, amount_minor, sender_msisdn, charge_id, raw_sha256, matched, parse_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&event_id)
     .bind(parsed.gateway)
@@ -55,6 +67,7 @@ pub async fn ingest(db: &Db, gw: &str, raw_body: &str) -> Result<Ingested, Inges
     .bind(&matched_charge)
     .bind(&raw_sha256)
     .bind(matched_charge.is_some() as i64)
+    .bind(parse_source)
     .execute(db)
     .await;
 
