@@ -97,7 +97,8 @@ async fn sender_mismatches(db: &Db) -> Result<Vec<Anomaly>, sqlx::Error> {
 /// Settled amounts far above the running average of matched inflow.
 async fn amount_outliers(db: &Db) -> Result<Vec<Anomaly>, sqlx::Error> {
     let (count, avg): (i64, f64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(AVG(amount_minor), 0) FROM sms_events WHERE matched = 1",
+        // 0.0 (not 0) so the empty-table fallback decodes as REAL, not INTEGER.
+        "SELECT COUNT(*), COALESCE(AVG(amount_minor), 0.0) FROM sms_events WHERE matched = 1",
     )
     .fetch_one(db)
     .await?;
@@ -177,6 +178,15 @@ mod tests {
 
         let report = scan(&db).await.unwrap();
         assert!(report.anomalies.iter().any(|a| a.kind == "sender_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn scans_empty_db_without_error() {
+        // Empty table → AVG is NULL → COALESCE must yield a REAL, not INTEGER,
+        // or the f64 decode fails. Regression guard for that live 500.
+        let db = test_db().await;
+        let report = scan(&db).await.unwrap();
+        assert_eq!(report.anomaly_count, 0);
     }
 
     #[tokio::test]
