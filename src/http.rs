@@ -58,6 +58,10 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .route("/v1/charges/:id", get(get_charge))
         .route("/v1/webhooks/sms", post(sms_webhook))
         .route("/v1/gateways", post(register_gateway))
+        .route(
+            "/v1/gateways/:gateway/regex-suggestion",
+            get(regex_suggestion),
+        )
         .route("/v1/ledger/query", get(ledger_query))
         .route("/v1/devices/pair", post(pair_device))
         .route("/v1/devices", get(list_devices))
@@ -182,6 +186,23 @@ async fn register_gateway(
         .await
         .map_err(db_error)?;
     Ok((StatusCode::CREATED, Json(gw)))
+}
+
+/// Ask the AI layer to propose updated regex from drifted SMS samples it recovered.
+/// Advisory only — a maintainer reviews and edits `gateway.rs` by hand; regex is
+/// never hot-swapped from model output. 404 when there's no drift data yet (or no
+/// AI keys configured).
+async fn regex_suggestion(
+    State(state): State<AppState>,
+    Path(gateway): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    match crate::ai::suggest_regex(&state.db, &gateway).await {
+        Some(s) => Ok((StatusCode::OK, Json(s))),
+        None => Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "no recovered drift samples for this gateway (or AI disabled)".into(),
+        )),
+    }
 }
 
 async fn ledger_query(

@@ -125,11 +125,12 @@ pub async fn extract(
         let parsed = result.as_deref().and_then(|c| parse_extraction(gateway, c));
 
         let _ = sqlx::query(
-            "INSERT INTO ai_parse_log (gateway, raw_sha256, provider, success, txn_id, amount_minor, sender_msisdn) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO ai_parse_log (gateway, raw_sha256, raw_body, provider, success, txn_id, amount_minor, sender_msisdn) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(gateway)
         .bind(raw_sha256)
+        .bind(raw_body)
         .bind(p.name)
         .bind(parsed.is_some() as i64)
         .bind(parsed.as_ref().map(|t| t.txn_id.clone()))
@@ -154,12 +155,98 @@ pub async fn extract(
     None
 }
 
+const SUGGEST_PROMPT: &str = "You are a Rust engineer maintaining regex parsers for \
+mobile-money (bKash/Nagad Bangladesh) confirmation SMS. Below are real SMS samples the \
+current parser FAILED on, one per line. Propose Rust `regex` crate patterns (with `(?i)` \
+where useful) that capture, in one group each: the transaction id (TrxID/TxnID), the \
+received amount, and the 11-digit sender number (01...). Reply with ONLY a JSON object, \
+no prose, no code fences: {\"txid\": string, \"amount\": string, \"sender\": string, \
+\"note\": string}. Each pattern is a raw regex string. `note` briefly says how the format \
+drifted.";
+
+#[derive(serde::Serialize)]
+pub struct RegexSuggestion {
+    pub gateway: String,
+    pub sample_count: i64,
+    pub txid: String,
+    pub amount: String,
+    pub sender: String,
+    pub note: String,
+}
+
+/// Look at the SMS samples regex missed but AI recovered, and ask the model to
+/// propose updated regex patterns. This is the human-in-the-loop path: a
+/// maintainer reviews the suggestion, then edits `gateway.rs` by hand. We never
+/// hot-swap regex from model output — money parsing stays code-reviewed.
+pub async fn suggest_regex(db: &Db, gateway: &str) -> Option<RegexSuggestion> {
+    let chain = providers_from_env();
+    let p = chain.first()?;
+
+    // Recovered drift samples: regex missed, AI succeeded, raw text captured.
+    let samples: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT raw_body FROM ai_parse_log \
+         WHERE gateway = ? AND success = 1 AND raw_body IS NOT NULL \
+         ORDER BY id DESC LIMIT 20",
+    )
+    .bind(gateway)
+    .fetch_all(db)
+    .await
+    .ok()?;
+
+    if samples.is_empty() {
+        return None;
+    }
+    let sample_count = samples.len() as i64;
+    let joined = samples.join("\n");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let content = call_chat(&client, p, SUGGEST_PROMPT, &joined).await?;
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+
+    #[derive(Deserialize)]
+    struct Raw {
+        txid: String,
+        amount: String,
+        sender: String,
+        note: String,
+    }
+    let raw: Raw = serde_json::from_str(&content[start..=end]).ok()?;
+
+    // Reject patterns the regex engine can't compile — never hand back garbage.
+    for pat in [&raw.txid, &raw.amount, &raw.sender] {
+        regex::Regex::new(pat).ok()?;
+    }
+
+    Some(RegexSuggestion {
+        gateway: gateway.to_string(),
+        sample_count,
+        txid: raw.txid,
+        amount: raw.amount,
+        sender: raw.sender,
+        note: raw.note,
+    })
+}
+
 async fn call_provider(client: &reqwest::Client, p: &Provider, sms: &str) -> Option<String> {
+    call_chat(client, p, EXTRACTION_PROMPT, sms).await
+}
+
+async fn call_chat(
+    client: &reqwest::Client,
+    p: &Provider,
+    system: &str,
+    user: &str,
+) -> Option<String> {
     let body = serde_json::json!({
         "model": p.model,
         "messages": [
-            { "role": "system", "content": EXTRACTION_PROMPT },
-            { "role": "user", "content": sms },
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
         ],
         "temperature": 0,
     });

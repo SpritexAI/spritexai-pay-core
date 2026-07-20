@@ -1,6 +1,6 @@
 //! M4 surface: reconciliation summary + device pairing token hygiene.
 
-use spritexai_pay::{charge, device, reconcile, sms};
+use spritexai_pay::{ai, charge, device, reconcile, sms};
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 
@@ -77,4 +77,12 @@ async fn pairing_returns_token_once_and_stores_only_hash() {
     let listed = device::list_devices(&db).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].status, "active");
+}
+
+#[tokio::test]
+async fn regex_suggestion_none_without_drift_data() {
+    // No AI keys + no recovered samples → nothing to suggest, never panics.
+    // Guards the query/no-op path so it survives without hitting the network.
+    let db = test_db().await;
+    assert!(ai::suggest_regex(&db, "bkash").await.is_none());
 }
