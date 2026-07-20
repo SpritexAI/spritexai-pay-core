@@ -12,6 +12,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod device;
+pub mod fraud;
 pub mod gateway;
 pub mod http;
 pub mod ledger;

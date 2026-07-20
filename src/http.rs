@@ -63,6 +63,8 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
             get(regex_suggestion),
         )
         .route("/v1/ledger/query", get(ledger_query))
+        .route("/v1/fraud/scan", get(fraud_scan))
+        .route("/v1/recon/chat", post(recon_chat))
         .route("/v1/devices/pair", post(pair_device))
         .route("/v1/devices", get(list_devices))
         .with_state(state)
@@ -214,6 +216,52 @@ async fn ledger_query(
         .await
         .map_err(db_error)?;
     Ok((StatusCode::OK, Json(summary)))
+}
+
+/// Deterministic anomaly scan over recorded events — duplicate TXIDs across
+/// gateways, sender mismatches, amount outliers. Rules, not a model verdict, so
+/// results are auditable.
+async fn fraud_scan(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let report = crate::fraud::scan(&state.db).await.map_err(db_error)?;
+    Ok((StatusCode::OK, Json(report)))
+}
+
+#[derive(Deserialize)]
+struct ChatQuestion {
+    question: String,
+}
+
+/// Reconciliation chat: a plain-language question is routed by the AI layer to a
+/// structured intent, then answered with a REAL deterministic query. The model
+/// only classifies — it never invents the numbers, so answers are ground truth.
+/// 503 when no AI keys are configured (routing needs a provider).
+async fn recon_chat(
+    State(state): State<AppState>,
+    Json(req): Json<ChatQuestion>,
+) -> Result<impl IntoResponse, ApiError> {
+    let intent = crate::ai::classify_question(&req.question)
+        .await
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reconciliation chat needs an AI provider (set OPENROUTER_API_KEY)".into(),
+            )
+        })?;
+
+    let answer = match intent.intent.as_str() {
+        "reconcile" => {
+            let r = reconcile::reconcile(&state.db, intent.gateway.as_deref())
+                .await
+                .map_err(db_error)?;
+            json!({ "intent": "reconcile", "data": r })
+        }
+        "fraud" => {
+            let r = crate::fraud::scan(&state.db).await.map_err(db_error)?;
+            json!({ "intent": "fraud", "data": r })
+        }
+        _ => json!({ "intent": "unknown", "data": null }),
+    };
+    Ok((StatusCode::OK, Json(answer)))
 }
 
 async fn pair_device(

@@ -267,9 +267,61 @@ async fn call_chat(
     chat.choices.into_iter().next().map(|c| c.message.content)
 }
 
+// ---- Reconciliation chat: NL question → structured intent → real ledger data ----
+
+const RECON_PROMPT: &str = "You translate a merchant's plain-language question about \
+their mobile-money settlements into a structured query. Reply with ONLY a JSON object, \
+no prose, no code fences: {\"intent\": \"reconcile\"|\"fraud\"|\"unknown\", \
+\"gateway\": \"bkash\"|\"nagad\"|null}. Use intent \"reconcile\" for questions about \
+totals, settled amounts, how much came in, or pending payments. Use \"fraud\" for \
+questions about suspicious, duplicate, or anomalous transactions. Use \"unknown\" if \
+the question is unrelated. Set gateway only if the question names one, else null.";
+
+#[derive(Deserialize)]
+pub struct ChatIntent {
+    pub intent: String,
+    pub gateway: Option<String>,
+}
+
+/// Parse a model reply into a reconciliation-chat intent. Tolerant of fences/prose.
+pub fn parse_intent(content: &str) -> Option<ChatIntent> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    let intent: ChatIntent = serde_json::from_str(&content[start..=end]).ok()?;
+    Some(intent)
+}
+
+/// Turn a natural-language question into a structured intent via the first provider.
+/// The caller executes the real (deterministic) query — the model only routes; it
+/// never reports numbers itself, so the answer is always ground truth.
+pub async fn classify_question(question: &str) -> Option<ChatIntent> {
+    let chain = providers_from_env();
+    let p = chain.first()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .ok()?;
+    let content = call_chat(&client, p, RECON_PROMPT, question).await?;
+    parse_intent(&content)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_extraction;
+    use super::{parse_extraction, parse_intent};
+
+    #[test]
+    fn parses_recon_intent() {
+        let i = parse_intent(r#"{"intent": "reconcile", "gateway": "bkash"}"#).unwrap();
+        assert_eq!(i.intent, "reconcile");
+        assert_eq!(i.gateway.as_deref(), Some("bkash"));
+    }
+
+    #[test]
+    fn intent_tolerates_fences() {
+        let i = parse_intent("```json\n{\"intent\": \"fraud\", \"gateway\": null}\n```").unwrap();
+        assert_eq!(i.intent, "fraud");
+        assert!(i.gateway.is_none());
+    }
 
     #[test]
     fn parses_clean_json() {
