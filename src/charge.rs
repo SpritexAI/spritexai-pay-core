@@ -94,6 +94,17 @@ pub async fn get(db: &Db, id: &str) -> Result<Charge, ChargeError> {
         .ok_or(ChargeError::NotFound)
 }
 
+/// Most recent charges first. ponytail: fixed cap, add cursor paging when a
+/// merchant's history outgrows a single screen.
+pub async fn list(db: &Db, limit: i64) -> Result<Vec<Charge>, ChargeError> {
+    Ok(
+        sqlx::query_as::<_, Charge>("SELECT * FROM charges ORDER BY created_at DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(db)
+            .await?,
+    )
+}
+
 /// Settle a confirmed charge: flip status to paid and post the balanced ledger
 /// transaction. Called from the SMS verification path in M2; exposed here so the
 /// ledger wiring lives with the charge it settles.

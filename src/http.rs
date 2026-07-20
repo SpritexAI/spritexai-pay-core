@@ -54,10 +54,10 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/v1/charges", post(create_charge))
+        .route("/v1/charges", post(create_charge).get(list_charges))
         .route("/v1/charges/:id", get(get_charge))
         .route("/v1/webhooks/sms", post(sms_webhook))
-        .route("/v1/gateways", post(register_gateway))
+        .route("/v1/gateways", post(register_gateway).get(list_gateways))
         .route(
             "/v1/gateways/:gateway/regex-suggestion",
             get(regex_suggestion),
@@ -137,6 +137,13 @@ async fn get_charge(
     Ok((StatusCode::OK, Json(charge)))
 }
 
+/// Recent charges, newest first. Capped so a busy merchant can't pull the whole
+/// history in one request; the dashboard shows the latest page.
+async fn list_charges(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let charges = charge::list(&state.db, 100).await?;
+    Ok((StatusCode::OK, Json(charges)))
+}
+
 #[derive(Deserialize)]
 struct SmsPayload {
     gateway: String,
@@ -188,6 +195,11 @@ async fn register_gateway(
         .await
         .map_err(db_error)?;
     Ok((StatusCode::CREATED, Json(gw)))
+}
+
+async fn list_gateways(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let gateways = device::list_gateways(&state.db).await.map_err(db_error)?;
+    Ok((StatusCode::OK, Json(gateways)))
 }
 
 /// Ask the AI layer to propose updated regex from drifted SMS samples it recovered.

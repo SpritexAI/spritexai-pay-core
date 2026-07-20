@@ -46,6 +46,12 @@ pub async fn register_gateway(db: &Db, req: RegisterGateway) -> Result<GatewayCo
         .await
 }
 
+pub async fn list_gateways(db: &Db) -> Result<Vec<GatewayConfig>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM gateway_configs ORDER BY created_at DESC")
+        .fetch_all(db)
+        .await
+}
+
 // ---- devices ----
 
 #[derive(Debug, Deserialize)]
