@@ -22,6 +22,11 @@ pub struct Config {
     // Directory of built dashboard assets. Served (with SPA fallback) only if it
     // exists — self-hosted API-only deployments simply omit it.
     pub static_dir: String,
+    // Admin console auth. When `admin_password` is None (env unset) the API is
+    // open — an existing self-hosted deployment isn't locked out by upgrading.
+    // Set ADMIN_PASSWORD to enforce login. `auth_secret` signs bearer tokens.
+    pub admin_password: Option<String>,
+    pub auth_secret: String,
 }
 
 impl Config {
@@ -36,6 +41,15 @@ impl Config {
             webhook_hmac_secret: env_or("WEBHOOK_HMAC_SECRET", "dev-insecure-webhook-secret"),
             redis_url: std::env::var("REDIS_URL").ok().filter(|s| !s.is_empty()),
             static_dir: env_or("STATIC_DIR", "./static"),
+            admin_password: std::env::var("ADMIN_PASSWORD")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            // Falls back to the SMS secret so tokens are still signed with a real
+            // secret even if AUTH_SECRET isn't set separately. Set it in prod.
+            auth_secret: std::env::var("AUTH_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| env_or("SMS_HMAC_SECRET", "dev-insecure-secret-change-me")),
         })
     }
 }

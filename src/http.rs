@@ -8,10 +8,12 @@ use crate::db::Db;
 use crate::device::{self, PairDevice, RegisterGateway};
 use crate::reconcile;
 use crate::sms::{self, IngestError};
+use axum::extract::Request;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -31,6 +33,9 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub db: Db,
     pub sms_hmac_secret: Arc<String>,
+    // None → auth disabled (API open). Some → login required on protected routes.
+    pub admin_password: Option<Arc<String>>,
+    pub auth_secret: Arc<String>,
 }
 
 pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
@@ -40,7 +45,14 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
     let state = AppState {
         db,
         sms_hmac_secret: Arc::new(cfg.sms_hmac_secret.clone()),
+        admin_password: cfg.admin_password.clone().map(Arc::new),
+        auth_secret: Arc::new(cfg.auth_secret.clone()),
     };
+    if state.admin_password.is_some() {
+        tracing::info!("admin auth enabled — console requires login");
+    } else {
+        tracing::warn!("ADMIN_PASSWORD unset — API is open (no login required)");
+    }
 
     // Per-client-IP rate limit: sustained ~10 req/s with a burst of 20. Uses the
     // smart extractor so it honors X-Forwarded-For behind a reverse proxy and falls
@@ -52,11 +64,12 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .finish()
         .expect("valid governor config");
 
-    let app = Router::new()
-        .route("/health", get(health))
+    // Admin-console routes: guarded by the bearer-token middleware when auth is on.
+    // The SMS webhook is deliberately NOT here — it authenticates with its own
+    // inbound HMAC (the Android forwarder has no admin token).
+    let protected = Router::new()
         .route("/v1/charges", post(create_charge).get(list_charges))
         .route("/v1/charges/:id", get(get_charge))
-        .route("/v1/webhooks/sms", post(sms_webhook))
         .route("/v1/gateways", post(register_gateway).get(list_gateways))
         .route(
             "/v1/gateways/:gateway/regex-suggestion",
@@ -67,6 +80,14 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .route("/v1/recon/chat", post(recon_chat))
         .route("/v1/devices/pair", post(pair_device))
         .route("/v1/devices", get(list_devices))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/auth/login", post(login))
+        .route("/v1/auth/status", get(auth_status))
+        .route("/v1/webhooks/sms", post(sms_webhook))
+        .merge(protected)
         .with_state(state)
         .layer(GovernorLayer {
             config: Arc::new(governor),
@@ -119,6 +140,64 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    password: String,
+}
+
+/// Exchange the admin password for a signed bearer token. When auth is disabled
+/// (no ADMIN_PASSWORD) this returns 404 — there's nothing to log into.
+async fn login(
+    State(state): State<AppState>,
+    Json(req): Json<LoginReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(admin) = state.admin_password.as_deref() else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "auth is not enabled".into(),
+        ));
+    };
+    if !crate::auth::password_matches(&state.auth_secret, admin, &req.password) {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid password".into(),
+        ));
+    }
+    let token = crate::auth::issue_token(&state.auth_secret);
+    Ok((StatusCode::OK, Json(json!({ "token": token }))))
+}
+
+/// Whether login is required. Lets the SPA decide to show a login screen without
+/// first bouncing a protected request off a 401.
+async fn auth_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({ "auth_required": state.admin_password.is_some() }))
+}
+
+/// Bearer-token guard for the admin console routes. No-op when auth is disabled.
+async fn require_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<impl IntoResponse, ApiError> {
+    if state.admin_password.is_none() {
+        return Ok(next.run(request).await);
+    }
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    if !crate::auth::verify_token(&state.auth_secret, token) {
+        return Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "authentication required".into(),
+        ));
+    }
+    Ok(next.run(request).await)
 }
 
 async fn create_charge(

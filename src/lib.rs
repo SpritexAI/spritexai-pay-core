@@ -7,6 +7,7 @@
 //! VPS: SQLite (WAL) by default, Redis only when horizontal scaling is needed.
 
 pub mod ai;
+pub mod auth;
 pub mod charge;
 pub mod config;
 pub mod crypto;
