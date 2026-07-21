@@ -5,12 +5,17 @@ use crate::charge::{self, ChargeError, CreateCharge};
 use crate::checkout::{self, CheckoutError, CreateCheckout};
 use crate::config::Config;
 use crate::crypto;
+use crate::customer::{self, CreateCustomer};
 use crate::db::Db;
 use crate::device::{self, PairDevice, RegisterGateway};
+use crate::domain::{self, CreateDomain};
+use crate::invoice::{self, CreateInvoice};
 use crate::merchant::{self, CreateApiKey};
+use crate::payment_link::{self, CreatePaymentLink};
 use crate::reconcile;
 use crate::sms::{self, IngestError};
 use axum::extract::Request;
+use axum::response::Redirect;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -90,9 +95,22 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
             post(create_merchant_key).get(list_merchant_keys),
         )
         .route("/v1/merchant-keys/:id/revoke", post(revoke_merchant_key))
+        .route("/v1/customers", post(create_customer).get(list_customers))
+        .route("/v1/customers/:id", get(get_customer))
+        .route("/v1/invoices", post(create_invoice).get(list_invoices))
+        .route("/v1/invoices/:id", get(get_invoice))
+        .route("/v1/invoices/:id/issue", post(issue_invoice))
+        .route("/v1/payment-links", post(create_link).get(list_links))
+        .route("/v1/domains", post(create_domain).get(list_domains))
+        .route("/v1/domains/:id", axum::routing::delete(delete_domain))
+        .route("/v1/settings", get(get_settings))
+        .route("/v1/settings/:key", axum::routing::put(put_setting))
+        .route("/v1/activities", get(list_activities))
+        .route("/v1/sms-events", get(list_sms_events))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    // Merchant checkout API — PipraPay-compatible, guarded by an API key (a separate
+    // Merchant checkout API — compatible with the common PHP SMS-gateway
+    // integration shape, guarded by an API key (a separate
     // trust boundary from admin auth). The key's scope is checked per-route.
     let merchant_api = Router::new()
         .route("/api/checkout/redirect", post(api_create_checkout))
@@ -113,6 +131,9 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .route("/v1/checkout/:pay_ref", get(checkout_status))
         .route("/v1/checkout/:pay_ref/select", post(checkout_select))
         .route("/v1/checkout/:pay_ref/claim", post(checkout_claim))
+        // Public payment link: open it → spawn a checkout and redirect to the pay page.
+        .route("/link/:ref", get(open_link))
+        .route("/v1/payment-links/:ref/open", post(open_link_amount))
         .merge(merchant_api)
         .merge(protected)
         .with_state(state)
@@ -261,7 +282,185 @@ async fn revoke_merchant_key(
     }
 }
 
-// ---- Merchant checkout API (API-key-guarded, PipraPay-compatible) ----
+// ---- Customers ----
+
+async fn create_customer(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCustomer>,
+) -> Result<impl IntoResponse, ApiError> {
+    let c = customer::create(&state.db, req).await.map_err(db_error)?;
+    Ok((StatusCode::CREATED, Json(c)))
+}
+
+async fn list_customers(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let list = customer::list(&state.db, 100).await.map_err(db_error)?;
+    Ok((StatusCode::OK, Json(list)))
+}
+
+async fn get_customer(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    match customer::get(&state.db, &id).await.map_err(db_error)? {
+        Some(c) => Ok((StatusCode::OK, Json(c))),
+        None => Err(ApiError(StatusCode::NOT_FOUND, "customer not found".into())),
+    }
+}
+
+// ---- Invoices ----
+
+async fn create_invoice(
+    State(state): State<AppState>,
+    Json(req): Json<CreateInvoice>,
+) -> Result<impl IntoResponse, ApiError> {
+    let inv = invoice::create(&state.db, req).await?;
+    Ok((StatusCode::CREATED, Json(inv)))
+}
+
+async fn list_invoices(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let list = invoice::list(&state.db, 100).await?;
+    Ok((StatusCode::OK, Json(list)))
+}
+
+async fn get_invoice(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    match invoice::get(&state.db, &id).await? {
+        Some(inv) => Ok((StatusCode::OK, Json(inv))),
+        None => Err(ApiError(StatusCode::NOT_FOUND, "invoice not found".into())),
+    }
+}
+
+async fn issue_invoice(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let base = resolve_base_url(&state, &headers);
+    let created = invoice::issue_payment(&state.db, &base, &id).await?;
+    Ok((StatusCode::OK, Json(json!({ "sap_url": created.sap_url }))))
+}
+
+// ---- Payment links ----
+
+async fn create_link(
+    State(state): State<AppState>,
+    Json(req): Json<CreatePaymentLink>,
+) -> Result<impl IntoResponse, ApiError> {
+    let link = payment_link::create(&state.db, req).await?;
+    Ok((StatusCode::CREATED, Json(link)))
+}
+
+async fn list_links(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let list = payment_link::list(&state.db, 100).await?;
+    Ok((StatusCode::OK, Json(list)))
+}
+
+/// Public: open a fixed-amount link → spawn a checkout and 302 to the pay page.
+async fn open_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(reference): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let base = resolve_base_url(&state, &headers);
+    let created = payment_link::open(&state.db, &base, &reference, None).await?;
+    Ok(Redirect::to(&created.sap_url))
+}
+
+#[derive(Deserialize)]
+struct OpenLinkBody {
+    amount: f64,
+}
+
+/// Public: open an open-amount link with a customer-entered amount.
+async fn open_link_amount(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(reference): Path<String>,
+    Json(body): Json<OpenLinkBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let base = resolve_base_url(&state, &headers);
+    let minor = (body.amount * 100.0).round() as i64;
+    let created = payment_link::open(&state.db, &base, &reference, Some(minor)).await?;
+    Ok((StatusCode::OK, Json(json!({ "sap_url": created.sap_url }))))
+}
+
+// ---- Domains ----
+
+async fn create_domain(
+    State(state): State<AppState>,
+    Json(req): Json<CreateDomain>,
+) -> Result<impl IntoResponse, ApiError> {
+    let d = domain::create(&state.db, req).await.map_err(db_error)?;
+    Ok((StatusCode::CREATED, Json(d)))
+}
+
+async fn list_domains(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let list = domain::list(&state.db).await.map_err(db_error)?;
+    Ok((StatusCode::OK, Json(list)))
+}
+
+async fn delete_domain(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let ok = domain::delete(&state.db, &id).await.map_err(db_error)?;
+    if ok {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "domain not found".into()))
+    }
+}
+
+// ---- Settings ----
+
+#[derive(Deserialize)]
+struct SettingsQuery {
+    group: String,
+}
+
+async fn get_settings(
+    State(state): State<AppState>,
+    Query(q): Query<SettingsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rows = crate::settings::get_group(&state.db, &q.group)
+        .await
+        .map_err(db_error)?;
+    Ok((StatusCode::OK, Json(rows)))
+}
+
+#[derive(Deserialize)]
+struct SetSetting {
+    value: String,
+}
+
+async fn put_setting(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<SetSetting>,
+) -> Result<impl IntoResponse, ApiError> {
+    crate::settings::set(&state.db, &key, &body.value)
+        .await
+        .map_err(db_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- Activities + SMS data (read-only over existing tables) ----
+
+async fn list_activities(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let list = crate::activity::list(&state.db, 100)
+        .await
+        .map_err(db_error)?;
+    Ok((StatusCode::OK, Json(list)))
+}
+
+async fn list_sms_events(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let list = sms::list_events(&state.db, 100).await.map_err(db_error)?;
+    Ok((StatusCode::OK, Json(list)))
+}
+
+// ---- Merchant checkout API (API-key-guarded; common PHP SMS-gateway shape) ----
 
 /// The scope the current request's API key satisfied — stashed by `require_api_key`.
 #[derive(Clone)]
@@ -643,6 +842,7 @@ impl From<CheckoutError> for ApiError {
         let code = match e {
             CheckoutError::InvalidAmount => StatusCode::UNPROCESSABLE_ENTITY,
             CheckoutError::NotFound => StatusCode::NOT_FOUND,
+            CheckoutError::DomainNotAllowed => StatusCode::UNPROCESSABLE_ENTITY,
             CheckoutError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if code == StatusCode::INTERNAL_SERVER_ERROR {
@@ -656,5 +856,38 @@ impl From<CheckoutError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+impl From<invoice::InvoiceError> for ApiError {
+    fn from(e: invoice::InvoiceError) -> Self {
+        use invoice::InvoiceError as E;
+        let code = match e {
+            E::InvalidAmount => StatusCode::UNPROCESSABLE_ENTITY,
+            E::NotFound => StatusCode::NOT_FOUND,
+            E::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        if code == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(error = %e, "invoice operation failed");
+            return ApiError(code, "internal error".into());
+        }
+        ApiError(code, e.to_string())
+    }
+}
+
+impl From<payment_link::LinkError> for ApiError {
+    fn from(e: payment_link::LinkError) -> Self {
+        use payment_link::LinkError as E;
+        let code = match e {
+            E::NotFound => StatusCode::NOT_FOUND,
+            E::Inactive => StatusCode::CONFLICT,
+            E::AmountRequired => StatusCode::UNPROCESSABLE_ENTITY,
+            E::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        if code == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(error = %e, "payment link operation failed");
+            return ApiError(code, "internal error".into());
+        }
+        ApiError(code, e.to_string())
     }
 }

@@ -4,7 +4,7 @@
 //! merchant's receiving number with copy + "send exactly ৳X" instructions, then
 //! poll until the SMS forwarder settles the charge and redirect to `return_url`.
 //! A collapsible manual box lets them submit a TrxID if the SMS is delayed.
-//! Light/clean PipraPay-style. Author: Mohammad Sijan (SpritexAI).
+//! Light/clean hosted-checkout styling. Author: Mohammad Sijan (SpritexAI).
 //!
 //! ponytail: inline HTML/CSS/JS in one Rust string — a checkout is a single screen;
 //! a templating engine + asset pipeline would be overkill. Extract only if it grows.

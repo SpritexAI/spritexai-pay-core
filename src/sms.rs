@@ -247,3 +247,29 @@ mod tests {
         assert_eq!(status_of(&db, &b.sap_id).await, "pending");
     }
 }
+
+/// Dashboard-safe projection of an SMS event. Deliberately omits `raw_sha256` and
+/// any raw body — the audit fingerprint never leaves the server. `parse_source`
+/// is intentionally excluded too; the feed shows what settled, not how it parsed.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct SmsEventView {
+    pub id: String,
+    pub gateway: String,
+    pub txn_id: String,
+    pub amount_minor: i64,
+    pub sender_msisdn: Option<String>,
+    pub charge_id: Option<String>,
+    pub matched: i64,
+    pub received_at: String,
+}
+
+/// Newest inbound SMS events first, capped at `limit`. Non-sensitive columns only.
+pub async fn list_events(db: &Db, limit: i64) -> Result<Vec<SmsEventView>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, gateway, txn_id, amount_minor, sender_msisdn, charge_id, matched, received_at \
+         FROM sms_events ORDER BY received_at DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(db)
+    .await
+}

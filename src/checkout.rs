@@ -1,6 +1,7 @@
 //! Hosted checkout — the customer-facing payment flow.
 //!
-//! A merchant creates a checkout via the API (PipraPay-compatible shape) and gets
+//! A merchant creates a checkout via the API (using the common PHP SMS-gateway
+//! integration shape) and gets
 //! back a public `pay_ref` + hosted URL. The customer opens that page, picks an MFS,
 //! sends money to the merchant's registered number, and the page polls until the
 //! SMS forwarder settles the charge. A manual TrxID box is a fallback hint only —
@@ -40,6 +41,8 @@ pub enum CheckoutError {
     InvalidAmount,
     #[error("checkout not found")]
     NotFound,
+    #[error("return_url or webhook_url host is not whitelisted")]
+    DomainNotAllowed,
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -65,8 +68,8 @@ pub struct Receiver {
 }
 
 /// Create a checkout charge and return `{sap_id, sap_url}` (SpritexAI Pay).
-/// The response shape mirrors PipraPay's create call (field names rebranded), so a
-/// PipraPay-style integration ports by renaming two keys.
+/// The response shape mirrors the common PHP SMS-gateway create call (field names
+/// rebranded), so such an integration ports by renaming two keys.
 /// `webhook_url` is stored on `callback_url` too, so the existing durable webhook
 /// worker delivers `charge.paid` on settlement with no new plumbing.
 pub async fn create_checkout(
@@ -76,6 +79,13 @@ pub async fn create_checkout(
 ) -> Result<CheckoutCreated, CheckoutError> {
     if !req.amount.is_finite() || req.amount <= 0.0 {
         return Err(CheckoutError::InvalidAmount);
+    }
+    // SSRF / open-redirect guard: both URLs must resolve to a whitelisted host.
+    // Empty whitelist = allow all (non-breaking for existing deploys).
+    if !crate::domain::is_allowed(db, req.return_url.as_deref()).await?
+        || !crate::domain::is_allowed(db, req.webhook_url.as_deref()).await?
+    {
+        return Err(CheckoutError::DomainNotAllowed);
     }
     let amount_minor = (req.amount * 100.0).round() as i64;
 

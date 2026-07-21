@@ -133,6 +133,10 @@ pub async fn mark_paid(db: &Db, id: &str) -> Result<(), ChargeError> {
         .execute(db)
         .await?;
 
+    // If this charge was collecting an invoice, flip that invoice to paid too.
+    // No-op for plain charges (no matching invoice row).
+    crate::invoice::settle_for_charge(db, id).await?;
+
     // Notify the merchant, if they registered a callback. Delivery is durable and
     // retried by the background worker — this only enqueues.
     if let Some(url) = charge.callback_url.as_deref() {
