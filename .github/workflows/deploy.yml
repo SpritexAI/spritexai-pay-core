@@ -43,6 +43,7 @@ jobs:
               --restart unless-stopped \
               -p 127.0.0.1:8080:8080 \
               -v spritexai_pay_data:/data \
+              -e BASE_URL="https://pay.rexio.pro" \
               -e SMS_HMAC_SECRET="${{ secrets.SMS_HMAC_SECRET }}" \
               -e WEBHOOK_HMAC_SECRET="${{ secrets.WEBHOOK_HMAC_SECRET }}" \
               -e ADMIN_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" \

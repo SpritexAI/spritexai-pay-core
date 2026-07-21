@@ -2,10 +2,12 @@
 //! engine grows (charges, webhooks, gateways, devices).
 
 use crate::charge::{self, ChargeError, CreateCharge};
+use crate::checkout::{self, CheckoutError, CreateCheckout};
 use crate::config::Config;
 use crate::crypto;
 use crate::db::Db;
 use crate::device::{self, PairDevice, RegisterGateway};
+use crate::merchant::{self, CreateApiKey};
 use crate::reconcile;
 use crate::sms::{self, IngestError};
 use axum::extract::Request;
@@ -36,6 +38,8 @@ pub struct AppState {
     // None → auth disabled (API open). Some → login required on protected routes.
     pub admin_password: Option<Arc<String>>,
     pub auth_secret: Arc<String>,
+    // Public base URL for building hosted checkout links; None → derive from Host.
+    pub base_url: Option<Arc<String>>,
 }
 
 pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
@@ -47,6 +51,7 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         sms_hmac_secret: Arc::new(cfg.sms_hmac_secret.clone()),
         admin_password: cfg.admin_password.clone().map(Arc::new),
         auth_secret: Arc::new(cfg.auth_secret.clone()),
+        base_url: cfg.base_url.clone().map(Arc::new),
     };
     if state.admin_password.is_some() {
         tracing::info!("admin auth enabled — console requires login");
@@ -80,7 +85,22 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .route("/v1/recon/chat", post(recon_chat))
         .route("/v1/devices/pair", post(pair_device))
         .route("/v1/devices", get(list_devices))
+        .route(
+            "/v1/merchant-keys",
+            post(create_merchant_key).get(list_merchant_keys),
+        )
+        .route("/v1/merchant-keys/:id/revoke", post(revoke_merchant_key))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    // Merchant checkout API — PipraPay-compatible, guarded by an API key (a separate
+    // trust boundary from admin auth). The key's scope is checked per-route.
+    let merchant_api = Router::new()
+        .route("/api/checkout/redirect", post(api_create_checkout))
+        .route("/api/verify-payment", post(api_verify_payment))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -88,6 +108,12 @@ pub async fn serve(cfg: Config, db: Db) -> anyhow::Result<()> {
         .route("/v1/auth/status", get(auth_status))
         .route("/v1/devices/exchange", post(exchange_token))
         .route("/v1/webhooks/sms", post(sms_webhook))
+        // Customer-facing checkout — public (no auth): the hosted page and its poll.
+        .route("/pay/:pay_ref", get(checkout_page))
+        .route("/v1/checkout/:pay_ref", get(checkout_status))
+        .route("/v1/checkout/:pay_ref/select", post(checkout_select))
+        .route("/v1/checkout/:pay_ref/claim", post(checkout_claim))
+        .merge(merchant_api)
         .merge(protected)
         .with_state(state)
         .layer(GovernorLayer {
@@ -201,6 +227,182 @@ async fn exchange_token(
             "unknown or revoked pairing token".into(),
         )),
         Err(e) => Err(db_error(e)),
+    }
+}
+
+// ---- Merchant API keys (admin-guarded) ----
+
+async fn create_merchant_key(
+    State(state): State<AppState>,
+    Json(req): Json<CreateApiKey>,
+) -> Result<impl IntoResponse, ApiError> {
+    let key = merchant::create_api_key(&state.db, req)
+        .await
+        .map_err(db_error)?;
+    Ok((StatusCode::CREATED, Json(key)))
+}
+
+async fn list_merchant_keys(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let keys = merchant::list_api_keys(&state.db).await.map_err(db_error)?;
+    Ok((StatusCode::OK, Json(keys)))
+}
+
+async fn revoke_merchant_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let ok = merchant::revoke_api_key(&state.db, &id)
+        .await
+        .map_err(db_error)?;
+    if ok {
+        Ok((StatusCode::OK, Json(json!({ "revoked": true }))))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "key not found".into()))
+    }
+}
+
+// ---- Merchant checkout API (API-key-guarded, PipraPay-compatible) ----
+
+/// The scope the current request's API key satisfied — stashed by `require_api_key`.
+#[derive(Clone)]
+#[allow(dead_code)] // carried for future per-key auditing/rate-limiting
+struct ApiScope(String);
+
+/// API-key middleware. Reads the key from `mh-piprapay-api-key` (PipraPay's header)
+/// or `Authorization: Bearer`, checks the scope the route needs, and passes the
+/// key context down via a request extension. A separate boundary from admin auth.
+async fn require_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut request: Request,
+    next: Next,
+) -> Result<impl IntoResponse, ApiError> {
+    let raw = headers
+        .get("mh-piprapay-api-key")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+        })
+        .unwrap_or("");
+
+    // Route → required scope: verify-payment needs verify_payment, else create_payment.
+    let required = if request.uri().path().contains("verify-payment") {
+        "verify_payment"
+    } else {
+        "create_payment"
+    };
+
+    match merchant::verify_api_key(&state.db, raw, required).await {
+        Ok(Some(ctx)) => {
+            request.extensions_mut().insert(ApiScope(ctx.id));
+            Ok(next.run(request).await)
+        }
+        Ok(None) => Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid API key or insufficient scope".into(),
+        )),
+        Err(e) => Err(db_error(e)),
+    }
+}
+
+/// Resolve the public base URL: configured value, else the request's Host header.
+fn resolve_base_url(state: &AppState, headers: &HeaderMap) -> String {
+    if let Some(b) = &state.base_url {
+        return b.as_str().to_string();
+    }
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    // Behind Cloudflare/any TLS proxy the original scheme is in this header.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    format!("{scheme}://{host}")
+}
+
+async fn api_create_checkout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateCheckout>,
+) -> Result<impl IntoResponse, ApiError> {
+    let base = resolve_base_url(&state, &headers);
+    let created = checkout::create_checkout(&state.db, &base, req).await?;
+    Ok((StatusCode::OK, Json(created)))
+}
+
+#[derive(Deserialize)]
+struct VerifyReq {
+    pp_id: String,
+}
+
+async fn api_verify_payment(
+    State(state): State<AppState>,
+    Json(req): Json<VerifyReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let result = checkout::verify(&state.db, &req.pp_id).await?;
+    Ok((StatusCode::OK, Json(result)))
+}
+
+// ---- Customer-facing checkout (public) ----
+
+async fn checkout_status(
+    State(state): State<AppState>,
+    Path(pay_ref): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let view = checkout::get_public_charge(&state.db, &pay_ref).await?;
+    Ok((StatusCode::OK, Json(view)))
+}
+
+#[derive(Deserialize)]
+struct SelectReq {
+    gateway: String,
+}
+
+async fn checkout_select(
+    State(state): State<AppState>,
+    Path(pay_ref): Path<String>,
+    Json(req): Json<SelectReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    checkout::select_gateway(&state.db, &pay_ref, &req.gateway).await?;
+    Ok((StatusCode::OK, Json(json!({ "ok": true }))))
+}
+
+#[derive(Deserialize)]
+struct ClaimReq {
+    trx_id: String,
+    sender: Option<String>,
+}
+
+async fn checkout_claim(
+    State(state): State<AppState>,
+    Path(pay_ref): Path<String>,
+    Json(req): Json<ClaimReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    checkout::submit_manual(&state.db, &pay_ref, &req.trx_id, req.sender.as_deref()).await?;
+    Ok((StatusCode::OK, Json(json!({ "ok": true }))))
+}
+
+/// Serve the self-contained hosted checkout page.
+async fn checkout_page(
+    State(state): State<AppState>,
+    Path(pay_ref): Path<String>,
+) -> impl IntoResponse {
+    match checkout::get_public_charge(&state.db, &pay_ref).await {
+        Ok(view) => axum::response::Html(crate::checkout_page::render(&view)).into_response(),
+        Err(CheckoutError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            axum::response::Html(crate::checkout_page::not_found()),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "checkout page load failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -430,6 +632,21 @@ impl From<IngestError> for ApiError {
         };
         if code == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::error!(error = %e, "sms ingest failed");
+            return ApiError(code, "internal error".into());
+        }
+        ApiError(code, e.to_string())
+    }
+}
+
+impl From<CheckoutError> for ApiError {
+    fn from(e: CheckoutError) -> Self {
+        let code = match e {
+            CheckoutError::InvalidAmount => StatusCode::UNPROCESSABLE_ENTITY,
+            CheckoutError::NotFound => StatusCode::NOT_FOUND,
+            CheckoutError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        if code == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(error = %e, "checkout operation failed");
             return ApiError(code, "internal error".into());
         }
         ApiError(code, e.to_string())

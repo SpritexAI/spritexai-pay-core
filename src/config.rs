@@ -27,6 +27,9 @@ pub struct Config {
     // Set ADMIN_PASSWORD to enforce login. `auth_secret` signs bearer tokens.
     pub admin_password: Option<String>,
     pub auth_secret: String,
+    // Public base URL of this engine (e.g. https://pay.rexio.pro), used to build
+    // hosted checkout links. Falls back to the request Host header when unset.
+    pub base_url: Option<String>,
 }
 
 impl Config {
@@ -50,6 +53,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| env_or("SMS_HMAC_SECRET", "dev-insecure-secret-change-me")),
+            base_url: std::env::var("BASE_URL").ok().filter(|s| !s.is_empty()),
         })
     }
 }
