@@ -14,13 +14,38 @@ receives the MFS confirmation SMS, forwards it here, and the engine verifies it,
 settles a double-entry ledger, and fires a signed webhook back to the merchant.
 
 ```
-POST /v1/charges          → create a payment intent
-POST /v1/webhooks/sms     → SMS in → parse → idempotency → ledger → merchant webhook
-GET  /v1/charges/:id      → charge status
-GET  /v1/ledger/query     → reconciliation summary
-POST /v1/gateways         → register a gateway (bKash / Nagad)
-POST /v1/devices/pair     → pair an Android forwarder (one-time token)
-GET  /v1/devices          → list paired devices
+POST /v1/charges                 → create a payment intent
+POST /v1/webhooks/sms            → SMS in → parse → idempotency → ledger → merchant webhook
+GET  /v1/charges/:id             → charge status
+GET  /v1/ledger/query            → reconciliation summary
+POST /v1/gateways                → register a gateway (bKash / Nagad)
+POST /v1/devices/pair            → pair an Android forwarder (one-time token)
+GET  /v1/devices                 → list paired devices
+GET  /v1/sms-events              → recent parsed SMS records
+GET  /v1/activities              → admin audit log
+```
+
+### Hosted checkout (API-key guarded)
+
+A merchant site collects payments without touching the SMS layer: create a
+checkout, redirect the customer to the hosted pay page, and the engine settles it
+when the confirmation SMS arrives.
+
+```
+POST /api/checkout/redirect      → { sap_id, sap_url } — hosted pay URL
+POST /api/verify-payment         → transaction status by sap_id
+GET  /pay/:ref                   → the hosted checkout page (public)
+```
+
+### Admin resources (bearer-token guarded)
+
+```
+POST/GET /v1/customers           → customer address book
+POST/GET /v1/invoices            → itemized invoices; POST /v1/invoices/:id/issue → pay URL
+POST/GET /v1/payment-links       → reusable links; GET /link/:ref opens a checkout
+POST/GET/DELETE /v1/domains      → return_url/webhook_url whitelist (empty = allow all)
+GET/PUT  /v1/settings            → brand / general / currency settings
+POST/GET /v1/merchant-keys       → API keys for the checkout endpoints
 ```
 
 ## Run it
@@ -41,6 +66,8 @@ Inbound SMS payloads must carry a matching `X-Signature` header.
 | `DATABASE_URL` | `sqlite://spritexai_pay.db?mode=rwc` | SQLite (WAL) or Postgres URL |
 | `SMS_HMAC_SECRET` | dev default | verifies inbound SMS forwarder payloads |
 | `WEBHOOK_HMAC_SECRET` | dev default | signs outbound merchant webhooks |
+| `ADMIN_PASSWORD` | unset | when set, the admin console + `/v1/*` routes require login; unset leaves the API open |
+| `BASE_URL` | derived from Host | public origin used to build hosted checkout / pay links |
 | `REDIS_URL` | unset | optional; only needed for multi-instance (Cloud) |
 
 ## Develop
