@@ -268,9 +268,9 @@ async fn revoke_merchant_key(
 #[allow(dead_code)] // carried for future per-key auditing/rate-limiting
 struct ApiScope(String);
 
-/// API-key middleware. Reads the key from `mh-piprapay-api-key` (PipraPay's header)
-/// or `Authorization: Bearer`, checks the scope the route needs, and passes the
-/// key context down via a request extension. A separate boundary from admin auth.
+/// API-key middleware. Reads the key from `x-sap-api-key` or `Authorization: Bearer`,
+/// checks the scope the route needs, and passes the key context down via a request
+/// extension. A separate boundary from admin auth.
 async fn require_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -278,7 +278,7 @@ async fn require_api_key(
     next: Next,
 ) -> Result<impl IntoResponse, ApiError> {
     let raw = headers
-        .get("mh-piprapay-api-key")
+        .get("x-sap-api-key")
         .and_then(|v| v.to_str().ok())
         .or_else(|| {
             headers
@@ -337,14 +337,14 @@ async fn api_create_checkout(
 
 #[derive(Deserialize)]
 struct VerifyReq {
-    pp_id: String,
+    sap_id: String,
 }
 
 async fn api_verify_payment(
     State(state): State<AppState>,
     Json(req): Json<VerifyReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let result = checkout::verify(&state.db, &req.pp_id).await?;
+    let result = checkout::verify(&state.db, &req.sap_id).await?;
     Ok((StatusCode::OK, Json(result)))
 }
 

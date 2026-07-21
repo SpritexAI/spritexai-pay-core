@@ -30,8 +30,8 @@ fn default_currency() -> String {
 
 #[derive(Debug, Serialize)]
 pub struct CheckoutCreated {
-    pub pp_id: String,
-    pub pp_url: String,
+    pub sap_id: String,
+    pub sap_url: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,7 +64,9 @@ pub struct Receiver {
     pub account_msisdn: Option<String>,
 }
 
-/// Create a checkout charge and return the PipraPay-shaped `{pp_id, pp_url}`.
+/// Create a checkout charge and return `{sap_id, sap_url}` (SpritexAI Pay).
+/// The response shape mirrors PipraPay's create call (field names rebranded), so a
+/// PipraPay-style integration ports by renaming two keys.
 /// `webhook_url` is stored on `callback_url` too, so the existing durable webhook
 /// worker delivers `charge.paid` on settlement with no new plumbing.
 pub async fn create_checkout(
@@ -109,8 +111,8 @@ pub async fn create_checkout(
     .await?;
 
     Ok(CheckoutCreated {
-        pp_id: pay_ref.clone(),
-        pp_url: format!("{}/pay/{}", base_url.trim_end_matches('/'), pay_ref),
+        sap_id: pay_ref.clone(),
+        sap_url: format!("{}/pay/{}", base_url.trim_end_matches('/'), pay_ref),
     })
 }
 
@@ -191,10 +193,10 @@ pub async fn submit_manual(
     Ok(())
 }
 
-/// PipraPay-compatible verify payload for `POST /api/verify-payment`.
+/// Verify payload for `POST /api/verify-payment` (SpritexAI Pay).
 #[derive(Debug, Serialize)]
 pub struct VerifyResult {
-    pub pp_id: String,
+    pub sap_id: String,
     pub full_name: Option<String>,
     pub email_address: Option<String>,
     pub mobile_number: Option<String>,
@@ -204,7 +206,7 @@ pub struct VerifyResult {
     pub transaction_id: Option<String>,
     pub sender: Option<String>,
     pub metadata: serde_json::Value,
-    /// Mapped to PipraPay vocabulary: paid → completed.
+    /// Public payment status: `pending` until settled, then `completed`.
     pub status: String,
     pub date: String,
 }
@@ -231,7 +233,7 @@ pub async fn verify(db: &Db, pay_ref: &str) -> Result<VerifyResult, CheckoutErro
     .to_string();
 
     Ok(VerifyResult {
-        pp_id: c.pay_ref.unwrap_or_default(),
+        sap_id: c.pay_ref.unwrap_or_default(),
         full_name: c.customer_name,
         email_address: c.customer_email,
         mobile_number: c.customer_msisdn,
@@ -302,10 +304,10 @@ mod tests {
         let out = create_checkout(&db, "https://pay.example", req(500.0))
             .await
             .unwrap();
-        assert!(out.pp_url.starts_with("https://pay.example/pay/pay_"));
-        assert_eq!(out.pp_id, out.pp_url.rsplit('/').next().unwrap());
+        assert!(out.sap_url.starts_with("https://pay.example/pay/pay_"));
+        assert_eq!(out.sap_id, out.sap_url.rsplit('/').next().unwrap());
 
-        let pub_view = get_public_charge(&db, &out.pp_id).await.unwrap();
+        let pub_view = get_public_charge(&db, &out.sap_id).await.unwrap();
         assert_eq!(pub_view.amount_minor, 50_000);
         assert_eq!(pub_view.status, "pending");
         // PublicCharge has no webhook_url / metadata fields — secrets can't leak here.
@@ -317,12 +319,12 @@ mod tests {
         let out = create_checkout(&db, "https://pay.example", req(300.0))
             .await
             .unwrap();
-        submit_manual(&db, &out.pp_id, "FAKE123", Some("01710000000"))
+        submit_manual(&db, &out.sap_id, "FAKE123", Some("01710000000"))
             .await
             .unwrap();
 
         // Still pending — a customer can't self-settle.
-        let v = verify(&db, &out.pp_id).await.unwrap();
+        let v = verify(&db, &out.sap_id).await.unwrap();
         assert_eq!(v.status, "pending");
         assert_eq!(v.transaction_id.as_deref(), Some("FAKE123"));
     }
@@ -343,13 +345,13 @@ mod tests {
         .await
         .unwrap();
 
-        let v = verify(&db, &out.pp_id).await.unwrap();
+        let v = verify(&db, &out.sap_id).await.unwrap();
         assert_eq!(v.status, "completed");
         assert_eq!(v.transaction_id.as_deref(), Some("REALTRX9"));
 
         // And the underlying charge is paid.
         let internal_id: String = sqlx::query_scalar("SELECT id FROM charges WHERE pay_ref = ?")
-            .bind(&out.pp_id)
+            .bind(&out.sap_id)
             .fetch_one(&db)
             .await
             .unwrap();
