@@ -2,8 +2,8 @@
 -- Author: Mohammad Sijan (SpritexAI). Postgres-portable.
 --
 -- This is the drop-in layer: a merchant site calls the checkout API with an API
--- key, gets a hosted pay URL, and redirects the customer. Mirrors the common PHP
--- SMS-gateway contract so existing integrations work by only swapping the base URL.
+-- key, gets a hosted pay URL, and redirects the customer. Mirrors PipraPay's
+-- contract so existing integrations work by only swapping the base URL.
 
 -- API keys authenticate merchant → engine calls. Stored hashed (SHA-256 via the
 -- same keyed digest as device tokens); the raw key is shown once at creation.
