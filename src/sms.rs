@@ -194,9 +194,13 @@ mod tests {
             .await
             .unwrap();
         // Paid from a different number than declared — still the sole claim on ৳700.
-        ingest(&db, "bkash", "received Tk 700.00 from 01999999999. TrxID TRX700A")
-            .await
-            .unwrap();
+        ingest(
+            &db,
+            "bkash",
+            "received Tk 700.00 from 01999999999. TrxID TRX700A",
+        )
+        .await
+        .unwrap();
         assert_eq!(status_of(&db, &a.sap_id).await, "paid");
     }
 
@@ -210,9 +214,13 @@ mod tests {
             .await
             .unwrap();
         // SMS from B's number → B settles, A stays pending. No oldest-first guess.
-        ingest(&db, "bkash", "received Tk 1500.00 from 01820000000. TrxID TRXB01")
-            .await
-            .unwrap();
+        ingest(
+            &db,
+            "bkash",
+            "received Tk 1500.00 from 01820000000. TrxID TRXB01",
+        )
+        .await
+        .unwrap();
         assert_eq!(status_of(&db, &b.sap_id).await, "paid");
         assert_eq!(status_of(&db, &a.sap_id).await, "pending");
     }
@@ -227,9 +235,13 @@ mod tests {
             .await
             .unwrap();
         // Paid from a number matching neither → refuse; nothing settles.
-        let out = ingest(&db, "bkash", "received Tk 1500.00 from 01990000000. TrxID TRXX01")
-            .await
-            .unwrap();
+        let out = ingest(
+            &db,
+            "bkash",
+            "received Tk 1500.00 from 01990000000. TrxID TRXX01",
+        )
+        .await
+        .unwrap();
         assert!(out.matched_charge.is_none());
         assert_eq!(status_of(&db, &a.sap_id).await, "pending");
         assert_eq!(status_of(&db, &b.sap_id).await, "pending");
